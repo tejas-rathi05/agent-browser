@@ -117,30 +117,48 @@ pub(super) async fn resolve_stable_click_center(
 ) -> Result<(f64, f64, String, (f64, f64)), String> {
     let mut last_preparation_error = None;
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
-        let (object_id, target_session) = resolve_element_object_id(
-            client, session_id, ref_map, selector_or_ref, iframe_sessions,
-        ).await?;
-        let scrolled = client.send_command(
-            "Runtime.callFunctionOn",
-            Some(serde_json::json!({
-                "objectId":object_id,
-                "functionDeclaration":"function() { this.scrollIntoView({behavior:'instant', block:'nearest', inline:'nearest'}); }",
-                "returnByValue":true,
-            })),
-            Some(&target_session),
-        ).await;
-        let _ = client.send_command(
-            "Runtime.releaseObject",
-            Some(serde_json::json!({"objectId":object_id})),
-            Some(&target_session),
-        ).await;
-        let scrolled = scrolled?;
-        if scrolled.get("exceptionDetails").is_some() {
-            return Err(format!("Could not prepare target '{selector_or_ref}' for clicking: {scrolled}"));
-        }
         let mut previous: Option<(f64, f64, String, (f64, f64))> = None;
         let mut stable_frames = 0;
+        let mut preparation = Some(false);
         loop {
+            if let Some(force_center) = preparation.take() {
+                let (object_id, target_session) = resolve_element_object_id(
+                    client, session_id, ref_map, selector_or_ref, iframe_sessions,
+                ).await?;
+                let scrolled = client.send_command(
+                    "Runtime.callFunctionOn",
+                    Some(serde_json::json!({
+                        "objectId":object_id,
+                        "arguments":[{"value":force_center}],
+                        "functionDeclaration":r#"function(forceCenter) {
+                            const doc = this.ownerDocument;
+                            const view = doc.defaultView;
+                            for (let ancestor = this.parentElement; ancestor; ancestor = ancestor.parentElement) {
+                                ancestor.scrollTo({left:ancestor.scrollLeft, top:ancestor.scrollTop, behavior:'instant'});
+                            }
+                            view.scrollTo({left:view.scrollX, top:view.scrollY, behavior:'instant'});
+                            const rect = this.getBoundingClientRect();
+                            const inView = rect.width > 0 && rect.height > 0 &&
+                                rect.bottom > 0 && rect.right > 0 &&
+                                rect.top < (view.innerHeight || doc.documentElement.clientHeight) &&
+                                rect.left < (view.innerWidth || doc.documentElement.clientWidth);
+                            const alignment = !forceCenter && inView ? 'nearest' : 'center';
+                            this.scrollIntoView({behavior:'instant', block:alignment, inline:alignment});
+                        }"#,
+                        "returnByValue":true,
+                    })),
+                    Some(&target_session),
+                ).await;
+                let _ = client.send_command(
+                    "Runtime.releaseObject",
+                    Some(serde_json::json!({"objectId":object_id})),
+                    Some(&target_session),
+                ).await;
+                let scrolled = scrolled?;
+                if scrolled.get("exceptionDetails").is_some() {
+                    return Err(format!("Could not prepare target '{selector_or_ref}' for clicking: {scrolled}"));
+                }
+            }
             let resolved = resolve_element_center(
                 client, session_id, ref_map, selector_or_ref, iframe_sessions, true,
             ).await;
@@ -150,6 +168,7 @@ pub(super) async fn resolve_stable_click_center(
                     last_preparation_error = Some(error);
                     previous = None;
                     stable_frames = 0;
+                    preparation = Some(true);
                     tokio::time::sleep(std::time::Duration::from_millis(16)).await;
                     continue;
                 }
